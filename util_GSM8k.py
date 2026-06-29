@@ -10,14 +10,13 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from datasets import load_dataset, DatasetDict
 from tqdm import tqdm
 
-DATASET_ID = "g8smk"
+DATASET_ID = "gsm8k"
 
-
-def load_g8smk(
+def load_gsm8k(
     test_size: float = 0.1,
     seed: int = 42,
 ) -> tuple:
-    """Load G8SMK dataset and return (train_split, test_split)."""
+    """Load GSM8K dataset and return (train_split, test_split)."""
     ds = load_dataset(DATASET_ID)
     if isinstance(ds, DatasetDict) and "train" in ds and "test" in ds:
         return ds["train"], ds["test"]
