@@ -13,6 +13,7 @@ from tqdm import tqdm
 DATASET_ID = "openai/gsm8k"
 DATASET_CONFIG = "main"
 
+
 def load_gsm8k(
     test_size: float = 0.1,
     seed: int = 42,
@@ -36,3 +37,47 @@ def print_rows(
     print(header)
     for i, row in enumerate(split.select(range(min(n, len(split))))):
         print(f"[{i}] {row}")
+
+
+def make_dataloaders(
+    train_split,
+    test_split,
+    model,
+    prepend_bos: bool,
+    batch_size: int = 8,
+    max_length: int = 512,
+) -> tuple[DataLoader, DataLoader]:
+    """
+    Return (train_loader, test_loader) for GSM8K.
+
+    Each batch dict contains:
+      input_ids  : (B, T) long  — left-padded question+answer tokens
+      prompt_lens: (B,)   long  — index into input_ids where the answer begins
+
+    To build a fine-tuning loss mask:
+      labels = input_ids.clone()
+      for i, pl in enumerate(prompt_lens):
+          labels[i, :pl] = -100
+    """
+    def collate(batch):
+        seqs, prompt_lens = [], []
+        for row in batch:
+            q = model.to_tokens(row["question"], prepend_bos=prepend_bos)[0].tolist()
+            a = model.to_tokens(row["answer"], prepend_bos=False)[0].tolist()
+            seq = (q + a)[:max_length]
+            seqs.append(seq)
+            prompt_lens.append(min(len(q), max_length))
+
+        max_len = max(len(s) for s in seqs)
+        padded = [[0] * (max_len - len(s)) + s for s in seqs]  # pad_id=0 for Gemma
+        padded_prompt_lens = [(max_len - len(s)) + pl for s, pl in zip(seqs, prompt_lens)]
+
+        return {
+            "input_ids": torch.tensor(padded, dtype=torch.long),
+            "prompt_lens": torch.tensor(padded_prompt_lens, dtype=torch.long),
+        }
+
+    # num_workers=0 required: model.to_tokens can't be pickled across processes
+    train_loader = DataLoader(train_split, batch_size=batch_size, shuffle=True,  drop_last=True,  collate_fn=collate)
+    test_loader  = DataLoader(test_split,  batch_size=batch_size, shuffle=False, drop_last=False, collate_fn=collate)
+    return train_loader, test_loader
