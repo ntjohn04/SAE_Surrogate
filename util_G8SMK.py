@@ -267,20 +267,35 @@ def print_dataset_summary(ds: GSM8KFeatureDataset, name: str = "Dataset"):
     if clipped > 0:
         print(f"  At max length:    {clipped} ({100 * clipped / len(ds):.1f}%)")
 
-    sample_acts = torch.stack([ds.feature_acts[i] for i in range(min(500, len(ds)))])
-    sparsity = (sample_acts == 0).float().mean().item()
-    nonzero_vals = sample_acts[sample_acts > 0]
-    print(f"\n  Feature activations (sampled from first {min(500, len(ds))} examples):")
-    print(f"    Sparsity:       {100 * sparsity:.1f}% zeros")
-    if nonzero_vals.numel() > 0:
-        print(f"    Non-zero mean:  {nonzero_vals.mean().item():.4f}")
-        print(f"    Non-zero max:   {nonzero_vals.max().item():.4f}")
+    n_sample = min(500, len(ds))
+    all_nonzero = []
+    total_elements = 0
+    total_zeros = 0
+    active_counts = []
+    global_max = 0.0
 
-    active_per_token = (sample_acts > 0).float().sum(dim=-1)
-    active_valid = active_per_token[active_per_token > 0]
-    if active_valid.numel() > 0:
-        print(f"    Active features/token: mean={active_valid.mean().item():.1f}, "
-              f"max={active_valid.max().item():.0f}")
+    for i in range(n_sample):
+        acts = ds.feature_acts[i]
+        total_elements += acts.numel()
+        total_zeros += (acts == 0).sum().item()
+        nz = acts[acts > 0]
+        if nz.numel() > 0:
+            all_nonzero.append(nz)
+            global_max = max(global_max, nz.max().item())
+        per_token = (acts > 0).sum(dim=-1).float()
+        active_counts.append(per_token[per_token > 0])
+
+    sparsity = total_zeros / total_elements if total_elements > 0 else 0.0
+    print(f"\n  Feature activations (sampled from first {n_sample} examples):")
+    print(f"    Sparsity:       {100 * sparsity:.1f}% zeros")
+    if all_nonzero:
+        combined = torch.cat(all_nonzero)
+        print(f"    Non-zero mean:  {combined.mean().item():.4f}")
+        print(f"    Non-zero max:   {global_max:.4f}")
+    if active_counts:
+        combined_active = torch.cat(active_counts)
+        print(f"    Active features/token: mean={combined_active.mean().item():.1f}, "
+              f"max={combined_active.max().item():.0f}")
 
     if ds.questions:
         q_lens = [len(q.split()) for q in ds.questions if q]
