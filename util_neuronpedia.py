@@ -4,6 +4,8 @@ import requests
 import torch
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable
+import pandas as pd
+from pathlib import Path
 
 DEFAULT_RELEASE = "gemma-scope-2b-pt-res"
 DEFAULT_SAE_ID = "layer_20/width_16k/average_l0_71"
@@ -213,9 +215,6 @@ def print_hits(
             print(f"      represents: unavailable ({info.error})")
         elif feature_infos is not None:
             print("      represents: no Neuronpedia explanation found")
-
-import pandas as pd
-from pathlib import Path
 
 def build_feature_catalog(
     release: str = DEFAULT_RELEASE,
