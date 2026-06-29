@@ -4,6 +4,7 @@ import gc
 from pathlib import Path
 
 import torch
+import numpy as np
 from torch.utils.data import Dataset, DataLoader, random_split
 from datasets import load_dataset
 from tqdm import tqdm
@@ -44,16 +45,19 @@ def get_feature_sequences_batch(sae, model, prepend_bos, hook_name, prompts, max
 # GSM8K loading
 # ---------------------------------------------------------------------------
 
-def load_gsm8k(split: str = "train", text_field: str = "question") -> list[str]:
-    """Load GSM8K from HuggingFace and return a list of prompt strings.
-
-    Parameters
-    ----------
-    split : "train" (7473 examples) or "test" (1319 examples).
-    text_field : which field to use as the prompt ("question" or "answer").
-    """
+def load_gsm8k_raw(split: str = "train"):
+    """Load GSM8K from HuggingFace and return (questions, answers) lists."""
     ds = load_dataset("openai/gsm8k", "main", split=split)
-    return [example[text_field] for example in ds]
+    questions = [ex["question"] for ex in ds]
+    answers = [ex["answer"] for ex in ds]
+    return questions, answers
+
+
+def parse_gsm8k_answer(answer: str) -> str | None:
+    """Extract the final numeric answer after '####' from a GSM8K answer string."""
+    if "####" in answer:
+        return answer.split("####")[-1].strip()
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -66,15 +70,17 @@ def precompute_features(
     prepend_bos: bool,
     hook_name: str,
     prompts: list[str],
-    max_length: int = 128,
+    questions: list[str],
+    answers: list[str],
+    max_length: int = 256,
     batch_size: int = 8,
     save_path: str | None = None,
-) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+) -> dict:
     """Run all prompts through model + SAE in batches, returning variable-length
     tensors trimmed to each sample's actual token count (no padding stored).
 
-    Returns lists of (token_ids, feature_acts, attention_mask) per sample,
-    and optionally saves to a .pt file for later reuse.
+    Returns a dict with keys: tokens, acts, masks, questions, answers.
+    Optionally saves to a .pt file for later reuse.
     """
     all_tokens: list[torch.Tensor] = []
     all_acts: list[torch.Tensor] = []
@@ -95,11 +101,19 @@ def precompute_features(
         gc.collect()
         torch.cuda.empty_cache()
 
+    data = {
+        "tokens": all_tokens,
+        "acts": all_acts,
+        "masks": all_masks,
+        "questions": questions,
+        "answers": answers,
+    }
+
     if save_path:
-        torch.save({"tokens": all_tokens, "acts": all_acts, "masks": all_masks}, save_path)
+        torch.save(data, save_path)
         print(f"Saved {len(all_tokens)} samples to {save_path}")
 
-    return all_tokens, all_acts, all_masks
+    return data
 
 
 def load_or_precompute(
@@ -110,18 +124,24 @@ def load_or_precompute(
     cache_path: str,
     split: str = "train",
     text_field: str = "question",
-    max_length: int = 128,
+    max_length: int = 256,
     batch_size: int = 8,
-) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+) -> dict:
     """Load cached feature activations from disk, or precompute and save them."""
     if Path(cache_path).exists():
         print(f"Loading cached features from {cache_path}")
         data = torch.load(cache_path, weights_only=False)
-        return data["tokens"], data["acts"], data["masks"]
+        if "questions" not in data:
+            questions, answers = load_gsm8k_raw(split=split)
+            data["questions"] = questions
+            data["answers"] = answers
+        return data
 
-    prompts = load_gsm8k(split=split, text_field=text_field)
+    questions, answers = load_gsm8k_raw(split=split)
+    prompts = questions if text_field == "question" else answers
     return precompute_features(
         sae, model, prepend_bos, hook_name, prompts,
+        questions=questions, answers=answers,
         max_length=max_length, batch_size=batch_size, save_path=cache_path,
     )
 
@@ -131,18 +151,45 @@ def load_or_precompute(
 # ---------------------------------------------------------------------------
 
 class GSM8KFeatureDataset(Dataset):
-    """Holds variable-length (token_ids, feature_acts, mask) tuples."""
+    """Holds variable-length (token_ids, feature_acts, mask) tuples
+    plus the original GSM8K question and answer strings for inspection."""
 
-    def __init__(self, token_ids: list[torch.Tensor], feature_acts: list[torch.Tensor], masks: list[torch.Tensor]):
+    def __init__(
+        self,
+        token_ids: list[torch.Tensor],
+        feature_acts: list[torch.Tensor],
+        masks: list[torch.Tensor],
+        questions: list[str] | None = None,
+        answers: list[str] | None = None,
+    ):
         self.token_ids = token_ids
         self.feature_acts = feature_acts
         self.masks = masks
+        self.questions = questions or [""] * len(token_ids)
+        self.answers = answers or [""] * len(token_ids)
 
     def __len__(self) -> int:
         return len(self.token_ids)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.token_ids[idx], self.feature_acts[idx], self.masks[idx]
+
+    @property
+    def num_features(self) -> int:
+        return self.feature_acts[0].shape[-1]
+
+    def get_example(self, idx: int) -> dict:
+        """Return a full example including original text (not just tensors)."""
+        return {
+            "index": idx,
+            "question": self.questions[idx],
+            "answer": self.answers[idx],
+            "final_answer": parse_gsm8k_answer(self.answers[idx]),
+            "token_ids": self.token_ids[idx],
+            "feature_acts": self.feature_acts[idx],
+            "mask": self.masks[idx],
+            "seq_len": int(self.masks[idx].sum().item()),
+        }
 
 
 def collate_fn(batch):
@@ -167,15 +214,12 @@ def collate_fn(batch):
 
 
 def create_dataloaders_from_split(
-    train_data: tuple[list, list, list],
-    test_data: tuple[list, list, list],
+    train_ds: GSM8KFeatureDataset,
+    test_ds: GSM8KFeatureDataset,
     batch_size: int = 32,
     num_workers: int = 0,
 ) -> tuple[DataLoader, DataLoader]:
-    """Create train/test DataLoaders from separate pre-computed splits."""
-    train_ds = GSM8KFeatureDataset(*train_data)
-    test_ds = GSM8KFeatureDataset(*test_data)
-
+    """Create train/test DataLoaders from separate datasets."""
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=num_workers)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=num_workers)
     return train_loader, test_loader
@@ -204,6 +248,93 @@ def create_dataloaders_random(
 
 
 # ---------------------------------------------------------------------------
+# Visualization / summary
+# ---------------------------------------------------------------------------
+
+def print_dataset_summary(ds: GSM8KFeatureDataset, name: str = "Dataset"):
+    """Print summary statistics for a GSM8KFeatureDataset."""
+    seq_lens = np.array([int(m.sum().item()) for m in ds.masks])
+    num_features = ds.num_features
+
+    print(f"\n{'=' * 60}")
+    print(f"  {name}")
+    print(f"{'=' * 60}")
+    print(f"  Samples:          {len(ds)}")
+    print(f"  Feature dim:      {num_features}")
+    print(f"  Seq length:       min={seq_lens.min()}, max={seq_lens.max()}, "
+          f"mean={seq_lens.mean():.1f}, median={np.median(seq_lens):.0f}")
+    clipped = (seq_lens == seq_lens.max()).sum()
+    if clipped > 0:
+        print(f"  At max length:    {clipped} ({100 * clipped / len(ds):.1f}%)")
+
+    sample_acts = torch.stack([ds.feature_acts[i] for i in range(min(500, len(ds)))])
+    sparsity = (sample_acts == 0).float().mean().item()
+    nonzero_vals = sample_acts[sample_acts > 0]
+    print(f"\n  Feature activations (sampled from first {min(500, len(ds))} examples):")
+    print(f"    Sparsity:       {100 * sparsity:.1f}% zeros")
+    if nonzero_vals.numel() > 0:
+        print(f"    Non-zero mean:  {nonzero_vals.mean().item():.4f}")
+        print(f"    Non-zero max:   {nonzero_vals.max().item():.4f}")
+
+    active_per_token = (sample_acts > 0).float().sum(dim=-1)
+    active_valid = active_per_token[active_per_token > 0]
+    if active_valid.numel() > 0:
+        print(f"    Active features/token: mean={active_valid.mean().item():.1f}, "
+              f"max={active_valid.max().item():.0f}")
+
+    if ds.questions:
+        q_lens = [len(q.split()) for q in ds.questions if q]
+        if q_lens:
+            print(f"\n  Question length (words): min={min(q_lens)}, max={max(q_lens)}, "
+                  f"mean={np.mean(q_lens):.1f}")
+
+    final_answers = [parse_gsm8k_answer(a) for a in ds.answers if a]
+    valid_answers = [a for a in final_answers if a is not None]
+    if valid_answers:
+        print(f"  Parsed final answers: {len(valid_answers)}/{len(ds)}")
+
+    print(f"{'=' * 60}\n")
+
+
+def print_sample(ds: GSM8KFeatureDataset, idx: int, top_k: int = 10, feature_catalog=None):
+    """Print a single example with its question, answer, and top active features."""
+    ex = ds.get_example(idx)
+
+    print(f"\n{'─' * 60}")
+    print(f"  Sample {idx}  (seq_len={ex['seq_len']})")
+    print(f"{'─' * 60}")
+    print(f"\n  Question:\n    {ex['question']}")
+    print(f"\n  Answer:\n    {ex['answer']}")
+    if ex["final_answer"]:
+        print(f"\n  Final answer: {ex['final_answer']}")
+
+    acts = ex["feature_acts"]
+    max_acts, _ = acts.max(dim=0)
+    top_vals, top_ids = torch.topk(max_acts, k=min(top_k, (max_acts > 0).sum().item()))
+
+    print(f"\n  Top {len(top_vals)} features (max activation across tokens):")
+    for rank, (fid, val) in enumerate(zip(top_ids, top_vals), 1):
+        fid_int = fid.item()
+        desc = ""
+        if feature_catalog is not None:
+            row = feature_catalog[feature_catalog["feature_id"] == fid_int]
+            if len(row) > 0 and not row.iloc[0].isna().get("feature_desc", True):
+                desc = f"  — {row.iloc[0]['feature_desc']}"
+        print(f"    {rank:>2}. feature={fid_int:<7} activation={val.item():>9.4f}{desc}")
+
+    print(f"{'─' * 60}\n")
+
+
+def print_samples(ds: GSM8KFeatureDataset, indices: list[int] | None = None,
+                  n: int = 3, top_k: int = 10, feature_catalog=None):
+    """Print multiple samples. Picks random indices if none provided."""
+    if indices is None:
+        indices = torch.randperm(len(ds))[:n].tolist()
+    for idx in indices:
+        print_sample(ds, idx, top_k=top_k, feature_catalog=feature_catalog)
+
+
+# ---------------------------------------------------------------------------
 # Convenience: full pipeline
 # ---------------------------------------------------------------------------
 
@@ -214,21 +345,29 @@ def load_gsm8k_dataloaders(
     hook_name: str,
     cache_dir: str = ".",
     text_field: str = "question",
-    max_length: int = 128,
+    max_length: int = 256,
     batch_size: int = 32,
     compute_batch_size: int = 8,
     num_workers: int = 0,
-) -> tuple[DataLoader, DataLoader]:
+) -> tuple[DataLoader, DataLoader, GSM8KFeatureDataset, GSM8KFeatureDataset]:
     """End-to-end: load GSM8K, precompute SAE features (cached to disk),
-    and return train / test DataLoaders using GSM8K's native splits.
+    and return train / test DataLoaders + Datasets using GSM8K's native splits.
+
+    Returns
+    -------
+    train_loader, test_loader, train_dataset, test_dataset
 
     Usage
     -----
-    >>> train_loader, test_loader = load_gsm8k_dataloaders(
+    >>> train_loader, test_loader, train_ds, test_ds = load_gsm8k_dataloaders(
     ...     sae, model, prepend_bos, hook_name,
     ...     cache_dir="/content/drive/MyDrive/sae_cache",
-    ...     max_length=128, batch_size=32,
     ... )
+    >>> # Inspect the raw data
+    >>> print_dataset_summary(train_ds, "Train")
+    >>> print_sample(train_ds, 0, feature_catalog=feature_catalog)
+    >>>
+    >>> # Train loop
     >>> for token_ids, feature_acts, mask in train_loader:
     ...     # token_ids:    [B, T]          int64
     ...     # feature_acts: [B, T, 16384]   float32
@@ -251,4 +390,17 @@ def load_gsm8k_dataloaders(
         max_length=max_length, batch_size=compute_batch_size,
     )
 
-    return create_dataloaders_from_split(train_data, test_data, batch_size=batch_size, num_workers=num_workers)
+    train_ds = GSM8KFeatureDataset(
+        train_data["tokens"], train_data["acts"], train_data["masks"],
+        train_data["questions"], train_data["answers"],
+    )
+    test_ds = GSM8KFeatureDataset(
+        test_data["tokens"], test_data["acts"], test_data["masks"],
+        test_data["questions"], test_data["answers"],
+    )
+
+    train_loader, test_loader = create_dataloaders_from_split(
+        train_ds, test_ds, batch_size=batch_size, num_workers=num_workers,
+    )
+
+    return train_loader, test_loader, train_ds, test_ds
