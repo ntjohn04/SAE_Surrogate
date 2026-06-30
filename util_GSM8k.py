@@ -93,9 +93,9 @@ def collate_gen(batch):
     ids = torch.tensor([r["id"] for r in batch])
     return {"input_ids": input_ids, "attention_mask": attention_mask, "ids": ids}
 
-def build_or_load(split, path, model, max_length, hook_name, sae, get_feature_acts):
+def build_or_load(split, path, model, max_length, hook_name, sae, get_feature_acts, force=False):
     path = Path(path)
-    if path.exists():
+    if path.exists() and not force:
         return torch.load(path)
     records = precompute(split, model, max_length, hook_name, sae, get_feature_acts)
     torch.save(records, path)
