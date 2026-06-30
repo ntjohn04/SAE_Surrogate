@@ -38,7 +38,70 @@ def print_rows(
     for i, row in enumerate(split.select(range(min(n, len(split))))):
         print(f"[{i}] {row}")
 
+@torch.no_grad()
+def precompute(split, model, max_length, hook_name, sae, get_feature_acts):
+    records = []
+    for i, row in enumerate(tqdm(split)):
+        prompt_text = model.tokenizer.apply_chat_template(
+            [{"role": "user", "content": row["question"]}],
+            tokenize=False, add_generation_prompt=True)
+        prompt_ids = model.to_tokens(prompt_text, prepend_bos=False)[0]   # template adds BOS
+        true_ids   = model.to_tokens(row["answer"], prepend_bos=False)[0]
 
+        seq = torch.cat([prompt_ids, true_ids])[:max_length]
+        # true-sequence acts: keep ONLY if you want true/gold acts on the shelf; else drop this line
+        fa = get_feature_acts(sae, model, hook_name, seq[None])[0].half().cpu()
+
+        records.append({
+            "id": i,
+            "prompt": prompt_text,                     # templated chat prompt
+            "true_answer": row["answer"],
+            "input_ids": seq,                          # prompt + true (for true-acts/analysis)
+            "prompt_len": len(prompt_ids),             # boundary = templated prompt length
+            "feature_acts_withtrue": fa.to_sparse(),            # true-sequence acts (optional)
+        })
+    return records
+
+def collate(batch):
+    B = len(batch)
+    max_len = max(len(r["input_ids"]) for r in batch)
+    F = batch[0]["feature_acts_withtrue"].shape[1]
+    input_ids      = torch.zeros(B, max_len, dtype=torch.long)
+    feature_acts   = torch.zeros(B, max_len, F, dtype=torch.float16)
+    attention_mask = torch.zeros(B, max_len, dtype=torch.long)
+    prompt_lens    = torch.empty(B, dtype=torch.long)
+    for i, r in enumerate(batch):
+        T   = len(r["input_ids"])
+        pad = max_len - T
+        input_ids[i, pad:]      = r["input_ids"]
+        feature_acts[i, pad:]   = r["feature_acts"].to_dense()   # <-- densify here
+        attention_mask[i, pad:] = 1
+        prompt_lens[i]          = pad + r["prompt_len"]
+    return {"input_ids": input_ids, "prompt_lens": prompt_lens,
+            "attention_mask": attention_mask, "feature_acts": feature_acts}
+
+def collate_gen(batch):
+    B = len(batch)
+    pad_id = 0
+    prompts = [r["input_ids"][:r["prompt_len"]] for r in batch]   # prompt only
+    Pmax = max(len(p) for p in prompts)
+    input_ids = torch.full((B, Pmax), pad_id, dtype=torch.long)
+    attention_mask = torch.zeros((B, Pmax), dtype=torch.long)
+    for i, p in enumerate(prompts):
+        input_ids[i, Pmax-len(p):]      = p            # LEFT pad
+        attention_mask[i, Pmax-len(p):] = 1
+    ids = torch.tensor([r["id"] for r in batch])
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "ids": ids}
+
+def build_or_load(split, path, model, max_length, hook_name, prepend_bos, sae, get_feature_acts):
+    path = Path(path)
+    if path.exists():
+        return torch.load(path)
+    records = precompute(split, model, max_length, hook_name, prepend_bos, sae, get_feature_acts)
+    torch.save(records, path)
+    return records
+
+"""
 def make_dataloaders(
     train_split,
     test_split,
@@ -47,7 +110,7 @@ def make_dataloaders(
     batch_size: int = 8,
     max_length: int = 512,
 ) -> tuple[DataLoader, DataLoader]:
-    """
+
     Return (train_loader, test_loader) for GSM8K.
 
     Each batch dict contains:
@@ -58,7 +121,7 @@ def make_dataloaders(
       labels = input_ids.clone()
       for i, pl in enumerate(prompt_lens):
           labels[i, :pl] = -100
-    """
+
     def collate(batch):
         seqs, prompt_lens = [], []
         for row in batch:
@@ -83,43 +146,4 @@ def make_dataloaders(
     train_loader = DataLoader(train_split, batch_size=batch_size, shuffle=True,  drop_last=True,  collate_fn=collate)
     test_loader  = DataLoader(test_split,  batch_size=batch_size, shuffle=False, drop_last=False, collate_fn=collate)
     return train_loader, test_loader
-
-@torch.no_grad()
-def precompute(split, model, max_length, hook_name, prepend_bos, sae, get_feature_acts):
-    records = []
-    for row in tqdm(split):
-        q = model.to_tokens(row["question"], prepend_bos=prepend_bos)[0].tolist()
-        a = model.to_tokens(row["answer"], prepend_bos=False)[0].tolist()
-        seq = (q + a)[:max_length]
-        ids = torch.tensor(seq, dtype=torch.long)
-        fa = get_feature_acts(sae, model, hook_name, ids[None])[0].half().cpu()
-        records.append({"input_ids": ids,
-                        "prompt_len": min(len(q), max_length),
-                        "feature_acts": fa.to_sparse()})        # <-- sparse store
-    return records
-
-def collate(batch):
-    B = len(batch)
-    max_len = max(len(r["input_ids"]) for r in batch)
-    F = batch[0]["feature_acts"].shape[1]
-    input_ids      = torch.zeros(B, max_len, dtype=torch.long)
-    feature_acts   = torch.zeros(B, max_len, F, dtype=torch.float16)
-    attention_mask = torch.zeros(B, max_len, dtype=torch.long)
-    prompt_lens    = torch.empty(B, dtype=torch.long)
-    for i, r in enumerate(batch):
-        T   = len(r["input_ids"])
-        pad = max_len - T
-        input_ids[i, pad:]      = r["input_ids"]
-        feature_acts[i, pad:]   = r["feature_acts"].to_dense()   # <-- densify here
-        attention_mask[i, pad:] = 1
-        prompt_lens[i]          = pad + r["prompt_len"]
-    return {"input_ids": input_ids, "prompt_lens": prompt_lens,
-            "attention_mask": attention_mask, "feature_acts": feature_acts}
-
-def build_or_load(split, path, model, max_length, hook_name, prepend_bos, sae, get_feature_acts):
-    path = Path(path)
-    if path.exists():
-        return torch.load(path)
-    records = precompute(split, model, max_length, hook_name, prepend_bos, sae, get_feature_acts)
-    torch.save(records, path)
-    return records
+"""
