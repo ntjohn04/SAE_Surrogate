@@ -71,10 +71,12 @@ def make_dataloaders(
         max_len = max(len(s) for s in seqs)
         padded = [[0] * (max_len - len(s)) + s for s in seqs]  # pad_id=0 for Gemma
         padded_prompt_lens = [(max_len - len(s)) + pl for s, pl in zip(seqs, prompt_lens)]
+        attention_mask = [[0]*(max_len-len(s)) + [1]*len(s) for s in seqs]
 
         return {
             "input_ids": torch.tensor(padded, dtype=torch.long),
             "prompt_lens": torch.tensor(padded_prompt_lens, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
         }
 
     # num_workers=0 required: model.to_tokens can't be pickled across processes
