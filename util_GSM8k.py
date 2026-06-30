@@ -83,3 +83,43 @@ def make_dataloaders(
     train_loader = DataLoader(train_split, batch_size=batch_size, shuffle=True,  drop_last=True,  collate_fn=collate)
     test_loader  = DataLoader(test_split,  batch_size=batch_size, shuffle=False, drop_last=False, collate_fn=collate)
     return train_loader, test_loader
+
+@torch.no_grad()
+def precompute(split, model, max_length, hook_name, prepend_bos, sae, get_feature_acts):
+    records = []
+    for row in tqdm(split):
+        q = model.to_tokens(row["question"], prepend_bos=prepend_bos)[0].tolist()
+        a = model.to_tokens(row["answer"], prepend_bos=False)[0].tolist()
+        seq = (q + a)[:max_length]
+        ids = torch.tensor(seq, dtype=torch.long)
+        fa = get_feature_acts(sae, model, hook_name, ids[None])[0].half().cpu()
+        records.append({"input_ids": ids,
+                        "prompt_len": min(len(q), max_length),
+                        "feature_acts": fa.to_sparse()})        # <-- sparse store
+    return records
+
+def collate(batch):
+    B = len(batch)
+    max_len = max(len(r["input_ids"]) for r in batch)
+    F = batch[0]["feature_acts"].shape[1]
+    input_ids      = torch.zeros(B, max_len, dtype=torch.long)
+    feature_acts   = torch.zeros(B, max_len, F, dtype=torch.float16)
+    attention_mask = torch.zeros(B, max_len, dtype=torch.long)
+    prompt_lens    = torch.empty(B, dtype=torch.long)
+    for i, r in enumerate(batch):
+        T   = len(r["input_ids"])
+        pad = max_len - T
+        input_ids[i, pad:]      = r["input_ids"]
+        feature_acts[i, pad:]   = r["feature_acts"].to_dense()   # <-- densify here
+        attention_mask[i, pad:] = 1
+        prompt_lens[i]          = pad + r["prompt_len"]
+    return {"input_ids": input_ids, "prompt_lens": prompt_lens,
+            "attention_mask": attention_mask, "feature_acts": feature_acts}
+
+def build_or_load(split, path, model, max_length, hook_name, prepend_bos, sae, get_feature_acts):
+    path = Path(path)
+    if path.exists():
+        return torch.load(path)
+    records = precompute(split, model, max_length, hook_name, prepend_bos, sae, get_feature_acts)
+    torch.save(records, path)
+    return records
