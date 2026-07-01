@@ -53,14 +53,12 @@ def precompute(split, model, max_length, hook_name, sae, get_feature_acts):
         prompt_ids = model.to_tokens(prompt_text, prepend_bos=False)[0]   # template adds BOS
         true_ids   = model.to_tokens(row["answer"], prepend_bos=False)[0]
 
-        seq = torch.cat([prompt_ids, true_ids])[:max_length]
-        # true-sequence acts: keep ONLY if you want true/gold acts on the shelf; else drop this line
-        fa = get_feature_acts(sae, model, hook_name, seq[None])[0].half().cpu()
-
         seq_full = torch.cat([prompt_ids, true_ids])
         if len(seq_full) > max_length:
             print(f"[trunc] id {i}: {len(seq_full)} -> {max_length} (prompt={len(prompt_ids)})")
         seq = seq_full[:max_length]
+
+        fa = get_feature_acts(sae, model, hook_name, seq[None])[0].half().cpu()
 
         records.append({
             "id": i,
