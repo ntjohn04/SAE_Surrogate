@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -13,6 +14,10 @@ from tqdm import tqdm
 DATASET_ID = "openai/gsm8k"
 DATASET_CONFIG = "main"
 
+def safe_save(obj, path):
+    tmp = str(path) + ".tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
 
 def load_gsm8k(
     test_size: float = 0.1,
@@ -52,16 +57,44 @@ def precompute(split, model, max_length, hook_name, sae, get_feature_acts):
         # true-sequence acts: keep ONLY if you want true/gold acts on the shelf; else drop this line
         fa = get_feature_acts(sae, model, hook_name, seq[None])[0].half().cpu()
 
+        seq_full = torch.cat([prompt_ids, true_ids])
+        if len(seq_full) > max_length:
+            print(f"[trunc] id {i}: {len(seq_full)} -> {max_length} (prompt={len(prompt_ids)})")
+        seq = seq_full[:max_length]
+
         records.append({
             "id": i,
             "prompt": prompt_text,                     # templated chat prompt
             "true_answer": row["answer"],
             "input_ids": seq,                          # prompt + true (for true-acts/analysis)
-            "prompt_len": len(prompt_ids),             # boundary = templated prompt length
+            #"prompt_len": len(prompt_ids),             # boundary = templated prompt length
+            "prompt_len": min(len(prompt_ids), len(seq)),
             "feature_acts_withtrue": fa.to_sparse(),            # true-sequence acts (optional)
         })
     return records
 
+def collate_gen(batch):
+    B = len(batch)
+    pad_id = 0
+    prompts = [r["input_ids"][:r["prompt_len"]] for r in batch]   # prompt only
+    Pmax = max(len(p) for p in prompts)
+    input_ids = torch.full((B, Pmax), pad_id, dtype=torch.long)
+    attention_mask = torch.zeros((B, Pmax), dtype=torch.long)
+    for i, p in enumerate(prompts):
+        input_ids[i, Pmax-len(p):]      = p            # LEFT pad
+        attention_mask[i, Pmax-len(p):] = 1
+    ids = torch.tensor([r["id"] for r in batch])
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "ids": ids}
+
+def build_or_load(split, path, model, max_length, hook_name, sae, get_feature_acts, force=False):
+    path = Path(path)
+    if path.exists() and not force:
+        return torch.load(path, weights_only=False)
+    records = precompute(split, model, max_length, hook_name, sae, get_feature_acts)
+    safe_save(records, path)
+    return records
+
+"""
 def collate(batch):
     B = len(batch)
     max_len = max(len(r["input_ids"]) for r in batch)
@@ -80,28 +113,6 @@ def collate(batch):
     return {"input_ids": input_ids, "prompt_lens": prompt_lens,
             "attention_mask": attention_mask, "feature_acts": feature_acts}
 
-def collate_gen(batch):
-    B = len(batch)
-    pad_id = 0
-    prompts = [r["input_ids"][:r["prompt_len"]] for r in batch]   # prompt only
-    Pmax = max(len(p) for p in prompts)
-    input_ids = torch.full((B, Pmax), pad_id, dtype=torch.long)
-    attention_mask = torch.zeros((B, Pmax), dtype=torch.long)
-    for i, p in enumerate(prompts):
-        input_ids[i, Pmax-len(p):]      = p            # LEFT pad
-        attention_mask[i, Pmax-len(p):] = 1
-    ids = torch.tensor([r["id"] for r in batch])
-    return {"input_ids": input_ids, "attention_mask": attention_mask, "ids": ids}
-
-def build_or_load(split, path, model, max_length, hook_name, sae, get_feature_acts, force=False):
-    path = Path(path)
-    if path.exists() and not force:
-        return torch.load(path)
-    records = precompute(split, model, max_length, hook_name, sae, get_feature_acts)
-    torch.save(records, path)
-    return records
-
-"""
 def make_dataloaders(
     train_split,
     test_split,
